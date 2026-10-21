@@ -1,0 +1,30 @@
+# Local IDE settings and Python caches
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build outputs and duplicate packaged test directory
+/build/
+/dist/
+/test/
+*.bak.py
+
+# Runtime captures and reward logs
+**/*screenshot*.png
+**/log/
+
+# Temporary and unrelated boot files
+/__chunk_data
+/bootmgr
+/bootmgr.efi
+/artifacts/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key

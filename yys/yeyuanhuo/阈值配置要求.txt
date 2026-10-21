@@ -1,7 +1,7 @@
 img_1:0.4
-img_2:0.5
+img_2:0.4
 img_3:10
-img_4:0.5
+img_4:0.4
 start_button: 0.7
 attack_icon: 0.8
 sleep_time: 0.5
