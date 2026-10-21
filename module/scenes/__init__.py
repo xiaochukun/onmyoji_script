@@ -4,6 +4,7 @@ from .yuhun import create_yuhun
 from .yeyuanhuo import create_yeyuanhuo
 from .huodong import create_huodong
 from .tupo import  create_tupo
+from .liaotupo import create_liaotupo
 
 
 SCENE_BUILDERS = {
@@ -13,4 +14,5 @@ SCENE_BUILDERS = {
     "yeyuanhuo": create_yeyuanhuo,
     "huodong": create_huodong,
     "tupo": create_tupo,
+    "liaotupo": create_liaotupo,
 }

@@ -28,3 +28,9 @@ venv/
 !.env.example
 *.pem
 *.key
+
+# Per-device local display preferences
+/settings.local.json
+
+# Navigation diagnostic captures
+**/entry_unmatched_*.png

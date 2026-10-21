@@ -1,4 +1,7 @@
+from module.task_lifecycle import TaskLifecycle
+from module.settings_store import get_resolution
 import threading
+import queue
 import subprocess
 import time
 import os
@@ -10,6 +13,10 @@ log_lock = threading.Lock()
 
 def safe_log(log_widget, msg):
     """线程安全地打印到 Tkinter 文本框"""
+    pending = getattr(log_widget, "pending_logs", None)
+    if pending is not None:
+        pending.put(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        return
     def append():
         with log_lock:
             log_widget.config(state='normal')
@@ -23,19 +30,37 @@ def safe_log(log_widget, msg):
         # 窗口关闭时避免报错
         pass
 
+def install_log_queue(widget):
+    """Workers only enqueue; all Tk operations run on the UI thread."""
+    widget.pending_logs = queue.Queue()
+    def drain():
+        lines = []
+        for _ in range(500):
+            try:
+                lines.append(widget.pending_logs.get_nowait())
+            except queue.Empty:
+                break
+        if lines:
+            widget.configure(state="normal")
+            widget.insert("end", "".join(lines))
+            widget.see("end")
+            widget.configure(state="disabled")
+        widget.after(100, drain)
+    widget.after(100, drain)
+
 # ---------------- 自动点击器 ----------------
-class AutoClicker:
+class AutoClicker(TaskLifecycle):
     def __init__(self, log_fn, scene_name, adb_port, thresholds=None):
         self.log = log_fn  # 这里传入 safe_log 或自定义函数
         self.scene_name = scene_name
         self.adb_port = adb_port
         self.running = False
+        self.init_lifecycle()
         self.thresholds = thresholds or {}
 
         self.image_dir = os.path.join(os.getcwd(), "yys", scene_name)
         self.adb_exe = os.path.join(os.getcwd(), "adb.exe")
-        self.mumu_width = 1600
-        self.mumu_height = 900
+        self.mumu_width, self.mumu_height = get_resolution(adb_port)
         self.sleep_time = 1
         self.recent_clicks = []
         self.templates = {}
@@ -88,9 +113,8 @@ class AutoClicker:
     def connect_device(self):
         device_id = f"127.0.0.1:{self.adb_port}"
         try:
-            subprocess.run([self.adb_exe, 'kill-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([self.adb_exe, 'start-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([self.adb_exe, 'connect', device_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([self.adb_exe, 'start-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            subprocess.run([self.adb_exe, 'connect', device_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
             time.sleep(1)
 
             if self.is_device_connected():
@@ -102,7 +126,7 @@ class AutoClicker:
 
     def is_device_connected(self):
         try:
-            result = subprocess.run([self.adb_exe, 'devices'], capture_output=True, text=True)
+            result = subprocess.run([self.adb_exe, 'devices'], capture_output=True, text=True, timeout=15)
             devices = result.stdout.strip().split('\n')
             devices = [d for d in devices[1:] if 'device' in d and 'offline' not in d]
             return any(f"127.0.0.1:{self.adb_port}" in d for d in devices)
@@ -116,16 +140,18 @@ class AutoClicker:
         try:
             with open(self.template_paths["screenshot"], "wb") as f:
                 subprocess.run([self.adb_exe, "-s", f"127.0.0.1:{self.adb_port}", "exec-out", "screencap", "-p"],
-                               stdout=f, check=True)
+                               stdout=f, check=True, timeout=15)
             return True
         except Exception as e:
             self.log(f"❌ 截图失败: {e}")
             return False
 
     def tap_screen(self, x, y):
+        if self.cancel_requested.is_set() or self.finish_requested.is_set():
+            return
         try:
             subprocess.run([self.adb_exe, "-s", f"127.0.0.1:{self.adb_port}", "shell", "input", "tap", str(x), str(y)],
-                           capture_output=True, text=True, check=True)
+                           capture_output=True, text=True, check=True, timeout=15)
             self.log(f"点击屏幕: ({x}, {y})")  # ✅ 新增每次点击日志
         except:
             self.log("点击失败")
@@ -137,6 +163,7 @@ class AutoClicker:
         return name, max_val, max_loc, (w, h)
 
     def stop(self):
+        self.cancel_requested.set()
         self.running = False
         self.log(f"🛑 端口 {self.adb_port} 停止")
 
@@ -150,11 +177,17 @@ class AutoClicker:
 
     def run(self):
         self.running = True
+        if self.finish_if_ready():
+            return
         self.recent_clicks = []
         self.log(f"🚀 端口 {self.adb_port} 自动点击启动")
 
+        if self.finish_if_ready():
+            return
         self.connect_device()
         while self.running:
+            if self.finish_if_ready():
+                break
             if not self.capture_screenshot():
                 time.sleep(2)
                 continue

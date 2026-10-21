@@ -4,8 +4,10 @@ import threading
 import subprocess
 import time
 
-from module.base_clicker import safe_log
+from module.base_clicker import safe_log, install_log_queue
 from module.scenes import SCENE_BUILDERS
+from module.desktop_ui import build_ui, show_task_dialog, scene_name
+from module.queue_runner import QueueRunner
 
 
 class AutoClickerApp:
@@ -17,42 +19,16 @@ class AutoClickerApp:
         self.task_timers = {}
         self.task_queue = []
         self.scheduler_running = False
+        self.scheduler_thread = None
+        self.queue_cancel = threading.Event()
+        self.queue_runners = {}
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def build_ui(self):
-        frame = ttk.Frame(self.root)
-        frame.pack(padx=10, pady=10, fill="x")
-        ttk.Label(frame, text="单场景选择:").grid(row=0, column=0)
-        self.scene_var = tk.StringVar(value="tansuo")
-        self.scene_dropdown = ttk.Combobox(frame, textvariable=self.scene_var,
-                                         values=list(SCENE_BUILDERS.keys()), state="readonly")
-        self.scene_dropdown.grid(row=0, column=1)
-        self.duration_var = tk.StringVar(value="0")
-        ttk.Label(frame, text="单场景时长(分钟):").grid(row=0, column=2)
-        ttk.Entry(frame, textvariable=self.duration_var, width=8).grid(row=0, column=3)
-        ttk.Label(frame, text="0 = 无限制").grid(row=0, column=4)
-        self.ticket_var = tk.StringVar(value="0")
-        ttk.Label(frame, text="单场景突破券数:").grid(row=2, column=3)
-        ttk.Entry(frame, textvariable=self.ticket_var, width=8).grid(row=2, column=4)
-        ttk.Label(frame, text="0 = 无限制（每个端口分别计数）").grid(row=3, column=4)
-        ttk.Label(frame, text="任务队列:").grid(row=1, column=0, sticky="ne")
-        self.task_listbox = tk.Listbox(frame, height=5)
-        self.task_listbox.grid(row=1, column=1)
-        ttk.Button(frame, text="添加任务", command=self.add_task).grid(row=1, column=2)
-        ttk.Button(frame, text="删除任务", command=self.delete_task).grid(row=2, column=2)
-        ttk.Label(frame, text="端口列表:").grid(row=3, column=0, sticky="ne")
-        self.port_listbox = tk.Listbox(frame, selectmode="multiple", height=5)
-        self.port_listbox.grid(row=3, column=1)
-        ttk.Button(frame, text="刷新端口", command=self.refresh_ports).grid(row=3, column=2)
-        ttk.Button(frame, text="添加端口", command=self.add_port).grid(row=4, column=1)
-        ttk.Button(frame, text="删除端口", command=self.delete_port).grid(row=4, column=2)
-        ttk.Button(frame, text="▶ 开始", command=self.start_bots).grid(row=5, column=0, pady=10)
-        ttk.Button(frame, text="■ 停止全部", command=self.stop_all_bots).grid(row=5, column=1)
-        self.log_box = scrolledtext.ScrolledText(self.root, width=80, height=20,
-                                               state="disabled", font=("Consolas", 10))
-        self.log_box.pack(padx=10, pady=10)
-        self.refresh_ports()
+        self.scene_codes = tuple(SCENE_BUILDERS)
+        build_ui(self)
+        install_log_queue(self.log_box)
 
     def refresh_ports(self):
         self.port_listbox.delete(0, tk.END)
@@ -80,22 +56,17 @@ class AutoClickerApp:
             self.port_listbox.delete(i)
 
     def add_task(self):
-        scene = simpledialog.askstring("添加任务", f"输入场景名:\n可用:{','.join(SCENE_BUILDERS.keys())}")
-        if scene not in SCENE_BUILDERS:
-            messagebox.showwarning("错误", "无效场景")
+        task = show_task_dialog(self)
+        if task is None:
             return
-        minutes = simpledialog.askinteger("运行时间", "请输入运行分钟数 (0 = 无限制):", initialvalue=0, minvalue=0)
-        if minutes is None:
-            return
-        tickets = 0
-        if scene == "tupo":
-            tickets = simpledialog.askinteger("突破券数", "请输入突破券数 (0 = 无限制):", initialvalue=0, minvalue=0)
-            if tickets is None:
-                return
-        self.task_queue.append((scene, minutes, tickets))
-        duration = f"{minutes}分钟" if minutes else "无限制"
-        quota = (f" - {tickets}张券" if tickets else " - 券数无限制") if scene == "tupo" else ""
-        self.task_listbox.insert(tk.END, f"{scene} - {duration}{quota}")
+        scene, minutes, tickets = task
+        self.task_queue.append(task)
+        duration = f"{minutes} 分钟" if minutes else "不限时长"
+        if scene == "liaotupo":
+            quota = f"  ·  最多 {tickets} 次" if tickets else "  ·  次数不限"
+        else:
+            quota = (f"  ·  {tickets} 张突破券" if tickets else "  ·  券数不限") if scene == "tupo" else ""
+        self.task_listbox.insert(tk.END, f"  {scene_name(scene)}  ·  {duration}{quota}")
 
     def delete_task(self):
         for i in reversed(list(self.task_listbox.curselection())):
@@ -103,6 +74,13 @@ class AutoClickerApp:
             del self.task_queue[i]
 
     def start_bots(self):
+        settings = getattr(self, "settings_window", None)
+        if settings is not None and settings.busy:
+            messagebox.showinfo("设置进行中", "请等待设备设置完成后再启动任务。", parent=self.root)
+            return
+        if (self.scheduler_thread is not None and self.scheduler_thread.is_alive()) or any(t.is_alive() for t in tuple(self.threads.values())):
+            messagebox.showinfo("任务正在运行", "请先停止现有任务并等待退出，再启动新的任务。", parent=self.root)
+            return
         selected = self.port_listbox.curselection()
         if not selected:
             messagebox.showwarning("警告", "请选择至少一个端口")
@@ -112,7 +90,10 @@ class AutoClickerApp:
             if self.scheduler_running:
                 return
             self.scheduler_running = True
-            threading.Thread(target=self.run_task_queue, args=(ports,), daemon=True).start()
+            self.queue_cancel.clear()
+            tasks = tuple(self.task_queue)
+            self.scheduler_thread = threading.Thread(target=self.run_task_queue, args=(ports, tasks), daemon=True)
+            self.scheduler_thread.start()
         else:
             self.start_single_scene(ports)
 
@@ -123,7 +104,7 @@ class AutoClickerApp:
             return
         try:
             minutes = int(self.duration_var.get())
-            tickets = int(self.ticket_var.get()) if scene == "tupo" else 0
+            tickets = int(self.ticket_var.get()) if scene in ("tupo", "liaotupo") else 0
             if tickets < 0 or minutes < 0:
                 raise ValueError
         except ValueError:
@@ -133,7 +114,7 @@ class AutoClickerApp:
             if port not in self.bots:
                 bot = SCENE_BUILDERS[scene](
                     log_fn=lambda msg, p=port: safe_log(self.log_box, f"[{p}] {msg}"),
-                    port=port, **({"ticket_limit": tickets} if scene == "tupo" else {}))
+                    port=port, **({"ticket_limit": tickets} if scene in ("tupo", "liaotupo") else {}))
                 t = threading.Thread(target=bot.run, daemon=True)
                 self.bots[port] = bot
                 self.threads[port] = t
@@ -142,8 +123,17 @@ class AutoClickerApp:
                 duration = f"{minutes}分钟" if minutes else "无限制"
                 safe_log(self.log_box, f"[{port}] {scene} 任务时长: {duration}")
                 if minutes:
-                    self.task_timers[port] = self.root.after(
-                        minutes * 60 * 1000, lambda p=port, b=bot: self.finish_timed_task(p, b))
+                    self.arm_task_timer(port, bot, minutes)
+
+    def arm_task_timer(self, port, bot, minutes):
+        if self.bots.get(port) is not bot or bot.cancel_requested.is_set():
+            return
+        ready = getattr(bot, "task_ready", None)
+        if ready is not None and not ready.is_set():
+            self.task_timers[port] = self.root.after(100, lambda: self.arm_task_timer(port, bot, minutes))
+            return
+        safe_log(self.log_box, f"[{port}] 入场完成，开始任务计时")
+        self.task_timers[port] = self.root.after(minutes * 60 * 1000, lambda: self.finish_timed_task(port, bot))
 
     def check_single_task(self, port, bot, thread):
         if self.bots.get(port) is not bot:
@@ -162,55 +152,74 @@ class AutoClickerApp:
             return
         self.task_timers.pop(port, None)
         bot.stop()
-        self.bots.pop(port, None)
-        self.threads.pop(port, None)
-        safe_log(self.log_box, f"[{port}] 时间结束，当前任务已停止")
+        safe_log(self.log_box, f"[{port}] 时间结束，正在停止当前任务")
 
-    def run_task_queue(self, ports):
-        safe_log(self.log_box, "开始执行任务队列")
-        for scene, minutes, tickets in tuple(self.task_queue):
-            if not self.scheduler_running:
-                break
-            safe_log(self.log_box, f"任务开始: {scene} " + (f"{minutes}分钟" if minutes else "无限制"))
+    def run_task_queue(self, ports, tasks=None):
+        safe_log(self.log_box, "开始执行任务队列，任务切换将确认实际游戏页面")
+        runners=[]
+        try:
             for port in ports:
-                bot = SCENE_BUILDERS[scene](
-                    log_fn=lambda msg, p=port: safe_log(self.log_box, f"[{p}] {msg}"),
-                    port=port, **({"ticket_limit": tickets} if scene == "tupo" else {}))
-                t = threading.Thread(target=bot.run, daemon=True)
-                self.bots[port] = bot
-                self.threads[port] = t
-                t.start()
-            start = time.monotonic()
-            while minutes == 0 or time.monotonic() - start < minutes * 60:
-                if not self.scheduler_running:
+                if self.queue_cancel.is_set():
                     break
-                if not any(t.is_alive() for t in self.threads.values()):
-                    break
-                time.sleep(1)
-            self.stop_current_bots()
-            safe_log(self.log_box, f"任务结束: {scene}")
-            if not self.scheduler_running:
-                break
-            time.sleep(3)
-        self.scheduler_running = False
-        safe_log(self.log_box, "任务队列执行完毕")
+                def on_bot(bot, p=port):
+                    if bot is None:
+                        self.bots.pop(p,None)
+                    else:
+                        self.bots[p]=bot
+                runner=QueueRunner(port,tuple(self.task_queue) if tasks is None else tasks,
+                                   self.queue_cancel,
+                                   lambda message,p=port:safe_log(self.log_box,f"[{p}] {message}"),on_bot)
+                self.queue_runners[port]=runner
+                self.threads[port]=runner.thread
+                runners.append(runner)
+                runner.start()
+            for runner in runners:
+                runner.thread.join()
+        finally:
+            for runner in runners:
+                self.bots.pop(runner.port,None)
+                if self.threads.get(runner.port) is runner.thread:
+                    self.threads.pop(runner.port,None)
+                self.queue_runners.pop(runner.port,None)
+            self.scheduler_running=False
+            safe_log(self.log_box,"所有设备的任务队列已结束")
 
     def stop_all_bots(self):
         self.scheduler_running = False
+        self.queue_cancel.set()
+        for runner in tuple(self.queue_runners.values()):
+            runner.stop()
         self.stop_current_bots()
 
     def stop_current_bots(self):
-        for timer in self.task_timers.values():
+        for timer in tuple(self.task_timers.values()):
             self.root.after_cancel(timer)
         self.task_timers.clear()
-        for _, bot in self.bots.items():
+        for port, bot in tuple(self.bots.items()):
             try:
                 bot.stop()
-            except:
+            except Exception:
                 pass
-        self.bots.clear()
-        self.threads.clear()
+            thread=self.threads.get(port)
+            if thread is None or not thread.is_alive():
+                self.bots.pop(port,None)
+                self.threads.pop(port,None)
 
     def on_closing(self):
+        settings = getattr(self, "settings_window", None)
+        if settings is not None:
+            settings.close()
+            if getattr(self, "settings_window", None) is not None:
+                return
+        self.ui_closing = True
+        if getattr(self, "ui_poll_id", None):
+            self.root.after_cancel(self.ui_poll_id)
         self.stop_all_bots()
-        self.root.destroy()
+        self.ui_summary.set("正在停止设备任务，等待日志保存后关闭…")
+        def finish_close():
+            scheduler_alive=self.scheduler_thread is not None and self.scheduler_thread.is_alive()
+            if scheduler_alive or any(t.is_alive() for t in tuple(self.threads.values())):
+                self.root.after(100,finish_close)
+                return
+            self.root.destroy()
+        finish_close()
